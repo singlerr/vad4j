@@ -12,92 +12,134 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class VAD implements Closeable {
 
-  private static final Logger LOGGER = LoggerFactory.getLogger(VAD.class);
+    public static final int QUALITY = 0;
+    public static final int LOW_BITRATE = 1;
+    public static final int AGGRESSIVE = 2;
+    public static final int VERY_AGGRESSIVE = 3;
+    public static final int CODE_SUCCESS = 0;
+    public static final int CODE_ERROR = -1;
+    public static final int ACTIVE_VOICE = 1;
+    public static final int NONACTIVE_VOICE = 0;
+    public static final int INVALID_FRAME = -1;
+    private static final Logger LOGGER = LoggerFactory.getLogger(VAD.class);
+    private AtomicBoolean stopped = new AtomicBoolean(false);
 
-  public static final float THRESHOLD = 0.6F;
+    private Pointer state;
 
-  private static final int CODE_SUCCESS = 0;
-  private static final int PACKET_MIN_SIZE = 320;
-  private static final int PACKET_SIZE_MS = 120;
-  private static final int PACKET_SIZE = 3840;
-  private static final int BOS_DELAY_MS = 400;
-  private static final int EOS_DELAY_MS = 1000;
-
-  private AtomicBoolean stopped = new AtomicBoolean(false);
-
-  private Pointer state;
-
-  public VAD() {
-    this(PACKET_SIZE_MS, BOS_DELAY_MS, EOS_DELAY_MS);
-  }
-
-  public VAD(int maxPacketSizeMs, int bosDelayMs, int eosDelayMs) {
-    state = Detector.INSTANCE.create_kika_vad_detector();
-    int result = Detector.INSTANCE.init_kika_vad_detector(state, maxPacketSizeMs, bosDelayMs, eosDelayMs);
-    if (CODE_SUCCESS != result) {
-      throw new VADException("Failed to init VAD");
-    }
-  }
-
-  public float speechProbability(byte[] pcm) {
-    if (null == pcm || pcm.length < PACKET_MIN_SIZE || pcm.length > PACKET_SIZE) {
-      return 0F;
+    public VAD() {
+        state = Detector.INSTANCE.fvad_new();
     }
 
-    short[] frame = Bytes.toShortArray(pcm);
-    try {
-      float score = Detector.INSTANCE.process_kika_vad_prob(state, frame, frame.length);
-      LOGGER.trace("score: {}", score);
-      return score;
-    } catch (Exception e) {
-      LOGGER.error(e.getMessage(), e);
-      return 0.0F;
-    }
-  }
-
-  public boolean isSpeech(byte[] pcm) {
-    return speechProbability(pcm) >= THRESHOLD;
-  }
-
-  public boolean isSilent(byte[] pcm) {
-    return speechProbability(pcm) < THRESHOLD;
-  }
-
-  @Override
-  public void close() {
-    if (stopped.getAndSet(true)) {
-      return;
+    public VAD(int sampleRate, int mode) {
+        state = Detector.INSTANCE.fvad_new();
+        int result = Detector.INSTANCE.fvad_set_mode(state, mode);
+        if (CODE_SUCCESS != result) {
+            throw new VADException("Failed to init VAD");
+        }
+        result = Detector.INSTANCE.fvad_set_sample_rate(state, sampleRate);
+        if (CODE_SUCCESS != result) {
+            throw new VADException("Failed to init VAD");
+        }
     }
 
-    LOGGER.info("closing VAD");
-    Detector.INSTANCE.destroy_kika_vad_detector(state);
-  }
+    public int speech(byte[] pcm) {
+        if (null == pcm) {
+            return INVALID_FRAME;
+        }
 
-  public interface Detector extends Library {
+        short[] frame = Bytes.toShortArray(pcm);
+        try {
+            int result = Detector.INSTANCE.fvad_process(state, frame, frame.length);
+            LOGGER.trace("result: {}", result);
+            return result;
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage(), e);
+            return INVALID_FRAME;
+        }
+    }
 
-    Detector INSTANCE = Native.loadLibrary("kvad", Detector.class);
+    public boolean isSpeech(byte[] pcm) {
+        return speech(pcm) == ACTIVE_VOICE;
+    }
 
-    Pointer create_kika_vad_detector();
+    public boolean isSilent(byte[] pcm) {
+        return speech(pcm) == NONACTIVE_VOICE;
+    }
 
-    /**
-     * @param vadDetector the pointer
-     * @param packetSizeMs packet size in ms, 120 ms recommended
-     * @param startDelayMs how long before the wave been treated as start of voice
-     * @param stopDelayMs low long before the wave been treated as end of voice
-     */
-    int init_kika_vad_detector(Pointer vadDetector, int packetSizeMs, int startDelayMs, int stopDelayMs);
+    @Override
+    public void close() {
+        if (stopped.getAndSet(true)) {
+            return;
+        }
 
-    int reset_kika_vad_detector(Pointer vadDetector);
+        LOGGER.info("closing VAD");
+        Detector.INSTANCE.fvad_free(state);
+    }
 
-    /**
-     * 1: voice
-     * 0: no voice
-     * &lt;0: crash
-     */
-    int process_kika_vad(Pointer state, short[] frame, int length);
+    public interface Detector extends Library {
 
-    float process_kika_vad_prob(Pointer state, short[] frame, int length);
+        Detector INSTANCE = Native.loadLibrary("kvad", Detector.class);
 
-    void destroy_kika_vad_detector(Pointer vadDetector);
-  }
+        /**
+         * Creates and initializes a VAD instance.
+         * <p>
+         * On success, returns a pointer to the new VAD instance, which should
+         * eventually be deleted using fvad_free().
+         * <p>
+         * Returns NULL in case of a memory allocation error.
+         */
+        Pointer fvad_new();
+
+        /**
+         * Changes the VAD operating ("aggressiveness") mode of a VAD instance.
+         * <p>
+         * A more aggressive (higher mode) VAD is more restrictive in reporting speech.
+         * Put in other words the probability of being speech when the VAD returns 1 is
+         * increased with increasing mode. As a consequence also the missed detection
+         * rate goes up.
+         * <p>
+         * Valid modes are 0 ("quality"), 1 ("low bitrate"), 2 ("aggressive"), and 3
+         * ("very aggressive"). The default mode is 0.
+         * <p>
+         * Returns 0 on success, or -1 if the specified mode is invalid.
+         */
+        int fvad_set_mode(Pointer vadDetector, int mode);
+
+
+        /**
+         * Reinitializes a VAD instance, clearing all state and resetting mode and
+         * sample rate to defaults.
+         */
+        int fvad_reset(Pointer vadDetector);
+
+        /**
+         * Calculates a VAD decision for an audio frame.
+         * <p>
+         * `frame` is an array of `length` signed 16-bit samples. Only frames with a
+         * length of 10, 20 or 30 ms are supported, so for example at 8 kHz, `length`
+         * must be either 80, 160 or 240.
+         * <p>
+         * Returns              : 1 - (active voice),
+         * 0 - (non-active Voice),
+         * -1 - (invalid frame length).
+         */
+        int fvad_process(Pointer inst, short[] frame, int length);
+
+        /**
+         * Sets the input sample rate in Hz for a VAD instance.
+         * <p>
+         * Valid values are 8000, 16000, 32000 and 48000. The default is 8000. Note
+         * that internally all processing will be done 8000 Hz; input data in higher
+         * sample rates will just be downsampled first.
+         * <p>
+         * Returns 0 on success, or -1 if the passed value is invalid.
+         */
+        int fvad_set_sample_rate(Pointer inst, int sampleRate);
+
+
+        /**
+         * Frees the dynamic memory of a specified VAD instance.
+         */
+        void fvad_free(Pointer vadDetector);
+    }
 }
